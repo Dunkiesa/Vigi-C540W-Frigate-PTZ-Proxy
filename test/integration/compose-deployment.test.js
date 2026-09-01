@@ -54,6 +54,9 @@ function capabilitiesResponse(marker) {
     ' xmlns:tds="http://www.onvif.org/ver10/device/wsdl">' +
     '<soap:Body><tds:GetCapabilitiesResponse><tds:Capabilities>' +
     `<tds:Device><tds:XAddr>http://${marker}/onvif/service</tds:XAddr></tds:Device>` +
+    // Non-XAddr identity element: the proxy rewrites XAddrs to its own origin,
+    // so upstream identity must live somewhere the rewrite never touches.
+    `<tds:LegacyUri>http://${marker}/keep</tds:LegacyUri>` +
     '</tds:Capabilities></tds:GetCapabilitiesResponse></soap:Body></soap:Envelope>'
   );
 }
@@ -282,10 +285,18 @@ describe(
       const res11 = await postSoap(hostPort11, GET_CAPABILITIES);
       assert.equal(res11.status, 200);
       assert.ok(res11.body.includes('http://cam-1-stub/'), 'cam-1 host port must answer with cam-1 upstream');
+      assert.ok(
+        !res11.body.includes('http://cam-1-stub/onvif/service'),
+        'cam-1 XAddr must have been re-pointed at the proxy origin'
+      );
 
       const res12 = await postSoap(hostPort12, GET_CAPABILITIES);
       assert.equal(res12.status, 200);
       assert.ok(res12.body.includes('http://cam-2-stub/'), 'cam-2 host port must answer with cam-2 upstream');
+      assert.ok(
+        !res12.body.includes('http://cam-2-stub/onvif/service'),
+        'cam-2 XAddr must have been re-pointed at the proxy origin'
+      );
 
       // Raw pass-through: every request either stub received was its own
       // GetCapabilities — inner body verbatim, plus the client's
@@ -312,14 +323,23 @@ describe(
       ]) {
         // Run the proxy image itself as a one-shot SOAP client against
         // http://<service>:8080/ — container-name addressing on the network.
+        // The marker lands in the stub's non-XAddr identity element, which
+        // the XAddr rewrite never touches.
         const client =
-          "const http=require('http');" +
-          "const body=" + JSON.stringify(GET_CAPABILITIES) + ";" +
-          `const req=http.request({host:'${service}',port:8080,path:'/onvif/service',method:'POST',` +
-          "headers:{'content-type':'application/soap+xml; charset=utf-8','content-length':Buffer.byteLength(body)}," +
-          "res=>{let t='';res.setEncoding('utf8');res.on('data',c=>t+=c);res.on('end'," +
-          `()=>{process.stdout.write(t.includes(${JSON.stringify(marker)})?'NAME_OK\\n':'NAME_BAD '+res.statusCode+'\\n');process.exit(0)})});` +
-          "req.on('error',e=>{console.error('CLIENTERR '+e.message);process.exit(2)});req.end(body);";
+          [
+            "const http=require('http');",
+            `const body=${JSON.stringify(GET_CAPABILITIES)};`,
+            `const marker=${JSON.stringify(marker)};`,
+            `const options={host:${JSON.stringify(service)},port:8080,path:'/onvif/service',method:'POST',` +
+              "headers:{'content-type':'application/soap+xml; charset=utf-8','content-length':Buffer.byteLength(body)}};",
+            'const req=http.request(options,(res)=>{',
+            "let t='';res.setEncoding('utf8');",
+            "res.on('data',(c)=>{t+=c});",
+            "res.on('end',()=>{process.stdout.write(t.includes(marker)?'NAME_OK\\n':'NAME_BAD '+res.statusCode+'\\n');process.exit(0)});",
+            '});',
+            "req.on('error',(e)=>{console.error('CLIENTERR '+e.message);process.exit(2)});",
+            'req.end(body);',
+          ].join('');
         const res = run('docker', ['run', '--rm', '--network', network, '--entrypoint', 'node', IMAGE_TAG, '-e', client], {
           env: composeEnv,
           timeoutMs: 60000,
