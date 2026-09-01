@@ -36,7 +36,7 @@ const { httpGet } = require('../helpers/http-get');
  */
 
 const REPO_ROOT = path.join(__dirname, '..', '..');
-const IMAGE_TAG = 'onvif-ptz-proxy:latest';
+const IMAGE_TAG = 'ghcr.io/dunkiesa/vigi-c540w-frigate-ptz-proxy:latest';
 
 /**
  * Docker is only worth driving when both the client and a reachable daemon

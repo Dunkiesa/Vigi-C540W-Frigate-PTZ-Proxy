@@ -15,7 +15,7 @@
 #      docker network create frigate
 #   3. Build the image (the compose file never builds; it only references
 #      the tag below):
-#      npm run docker:build   # = docker build -t onvif-ptz-proxy:latest .
+#      npm run docker:build   # = docker build -t ghcr.io/dunkiesa/vigi-c540w-frigate-ptz-proxy:latest .
 #   4. docker compose up -d
 #
 # Addressing:
@@ -49,7 +49,7 @@ x-proxy-healthcheck: &proxy-healthcheck
 
 services:
   proxy-cam-1:
-    image: onvif-ptz-proxy:latest
+    image: ghcr.io/dunkiesa/vigi-c540w-frigate-ptz-proxy:latest
     container_name: proxy-cam-1
     env_file:
       - ${CAM1_ENV_FILE:-env/cam-1.env}
@@ -66,7 +66,7 @@ services:
       - "host.docker.internal:host-gateway"
 
   proxy-cam-2:
-    image: onvif-ptz-proxy:latest
+    image: ghcr.io/dunkiesa/vigi-c540w-frigate-ptz-proxy:latest
     container_name: proxy-cam-2
     env_file:
       - ${CAM2_ENV_FILE:-env/cam-2.env}
