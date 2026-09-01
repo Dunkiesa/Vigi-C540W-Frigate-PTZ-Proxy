@@ -6,7 +6,7 @@
 # entirely through environment variables at container start (ADR-0006);
 # nothing camera-specific is baked in here.
 
-FROM node:22-alpine
+FROM node:26-alpine
 
 ENV NODE_ENV=production
 WORKDIR /app

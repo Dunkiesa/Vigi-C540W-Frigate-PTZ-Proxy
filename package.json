@@ -5,7 +5,7 @@
   "description": "ONVIF PTZ proxy for Frigate autotracking. Forwards SOAP between Frigate and the upstream camera, injects TranslationSpaceFov into GetConfigurationOptions, and translates FOV-space RelativeMove to generic-space.",
   "type": "commonjs",
   "engines": {
-    "node": ">=20"
+    "node": ">=26"
   },
   "scripts": {
     "test": "node --test --test-reporter=spec \"test/**/*.test.js\"",
