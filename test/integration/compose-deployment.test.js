@@ -8,7 +8,6 @@ const http = require('node:http');
 const os = require('node:os');
 const path = require('node:path');
 
-const { StubServer } = require('../helpers/stub-server');
 const { envelope, clientSecurity } = require('../helpers/soap-fixtures');
 const { findEphemeralPort } = require('../helpers/boot-proxy');
 const { httpGet } = require('../helpers/http-get');
@@ -18,7 +17,10 @@ const { httpGet } = require('../helpers/http-get');
  *
  * Seam: the shipped Dockerfile (built out-of-band via `docker build`, never
  * by Compose) + docker-compose.yml, driven through the real `docker compose`
- * CLI against stub upstreams. Verifies the checklist:
+ * CLI against stub upstreams. The stubs run as containers on the project's
+ * own network — not on the host — so the test never depends on
+ * container-to-host routing, which firewalls handle differently between
+ * Docker Desktop and CI runners. Verifies the checklist:
  *   - the Dockerfile build produces a runnable image serving the HTTP
  *     listener, under the exact tag the compose file references;
  *   - two instances of that image, with different `.env` files, run
@@ -59,6 +61,27 @@ function capabilitiesResponse(marker) {
     `<tds:LegacyUri>http://${marker}/keep</tds:LegacyUri>` +
     '</tds:Capabilities></tds:GetCapabilitiesResponse></soap:Body></soap:Envelope>'
   );
+}
+
+/**
+ * One-shot Node program for a stub container: answer every POST with a
+ * canned SOAP body and echo each received request to stdout as
+ * `STUBREQ {json}` so the test can inspect what actually arrived via
+ * `docker logs`.
+ *
+ * @param {string} body canned response
+ * @returns {string}
+ */
+function stubScript(body) {
+  return [
+    "const http=require('http');",
+    `const body=${JSON.stringify(body)};`,
+    'http.createServer((req,res)=>{',
+    "let t='';req.setEncoding('utf8');",
+    "req.on('data',(c)=>{t+=c});",
+    "req.on('end',()=>{console.log('STUBREQ '+JSON.stringify({method:req.method,url:req.url,body:t}));res.writeHead(200,{'Content-Type':'application/soap+xml; charset=utf-8'});res.end(body)});",
+    "}).listen(8080,'0.0.0.0');",
+  ].join('');
 }
 
 // The client (Frigate) supplies credentials per-request (ADR-0008): the
@@ -126,32 +149,32 @@ describe(
   () => {
     const project = `ptz-smoke-${process.pid}`;
     const network = project;
+    const stub1 = `${project}-stub-1`;
+    const stub2 = `${project}-stub-2`;
     /** @type {string[]} */ let composeEnvFiles = [];
     /** @type {string} */ let tmpDir = '';
     /** @type {NodeJS.ProcessEnv} */ let composeEnv = { ...process.env };
-    /** @type {any} */ let stubCAM1;
-    /** @type {any} */ let stubCAM2;
     /** @type {number} */ let hostPort11 = 0;
     /** @type {number} */ let hostPort12 = 0;
     let composeStarted = false;
 
     /**
-     * One service's per-instance env file, pointing its upstream leg at a
-     * host-run stub via host.docker.internal (provided by the compose file's
-     * extra_hosts mapping — the same route a LAN camera IP takes through the
-     * host's LAN interface).
+     * One service's per-instance env file, pointing its upstream leg at the
+     * stub container that shares the project network — the same DNS route a
+     * LAN camera IP takes in a real deployment, minus any host-firewall
+     * dependency.
      *
      * @param {string} name
-     * @param {number} upstreamPort
+     * @param {string} upstreamHost
      * @param {Record<string, string>} overrides
      * @returns {string} absolute path
      */
-    function writeEnvFile(name, upstreamPort, overrides) {
+    function writeEnvFile(name, upstreamHost, overrides) {
       // No credential vars: the client supplies them per-request and the
       // proxy relays them (ADR-0008).
       const lines = [
-        'UPSTREAM_HOST=host.docker.internal',
-        `UPSTREAM_PORT=${upstreamPort}`,
+        `UPSTREAM_HOST=${upstreamHost}`,
+        'UPSTREAM_PORT=8080',
         'LISTEN_PORT=8080',
         'LOG_LEVEL=debug',
         ...Object.entries(overrides).map(([k, v]) => `${k}=${v}`),
@@ -173,19 +196,51 @@ describe(
       );
     }
 
+    /** @param {string} containerName @returns {{ method: string, url: string, body: string }[]} */
+    function stubRequests(containerName) {
+      const logs = run('docker', ['logs', containerName], { timeoutMs: 30000 });
+      assert.equal(logs.status, 0, `docker logs ${containerName} failed: ${logs.stderr}`);
+      return logs.stdout
+        .split('\n')
+        .filter((line) => line.startsWith('STUBREQ '))
+        .map((line) => JSON.parse(line.slice('STUBREQ '.length)));
+    }
+
+    /**
+     * Start a stub-camera container on the project network, answering SOAP
+     * POSTs with the given capabilities body (identified by marker).
+     *
+     * @param {string} containerName @param {string} marker
+     */
+    function startStubContainer(containerName, marker) {
+      const res = run(
+        'docker',
+        ['run', '-d', '--rm', '--network', network, '--name', containerName, '--entrypoint', 'node', IMAGE_TAG, '-e', stubScript(capabilitiesResponse(marker))],
+        { timeoutMs: 60000 }
+      );
+      assert.equal(res.status, 0, `stub container ${containerName} failed to start: ${res.stderr}`);
+    }
+
     before(async () => {
       tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ptz-compose-smoke-'));
       composeEnvFiles = [];
 
-      // Docker Desktop reaches host loopback through host.docker.internal;
-      // on Linux the connection arrives at a routable interface, so bind all.
-      stubCAM1 = await StubServer.start({ host: '0.0.0.0', status: 200, body: capabilitiesResponse('cam-1-stub') });
-      stubCAM2 = await StubServer.start({ host: '0.0.0.0', status: 200, body: capabilitiesResponse('cam-2-stub') });
       hostPort11 = await findEphemeralPort();
       hostPort12 = await findEphemeralPort();
 
-      const env11 = writeEnvFile('cam-1', stubCAM1.port(), { HFOV_DEG: '79.1' });
-      const env12 = writeEnvFile('cam-2', stubCAM2.port(), { HFOV_DEG: '81.9' });
+      const net = run('docker', ['network', 'create', network], { timeoutMs: 30000 });
+      assert.equal(net.status, 0, `docker network create failed: ${net.stderr}`);
+
+      const build = run('docker', ['build', '-t', IMAGE_TAG, '.'], { timeoutMs: 600000 });
+      assert.equal(build.status, 0, `docker build failed:\n${build.stdout}\n${build.stderr}`);
+
+      // Stub cameras as containers on the shared network, before the proxies
+      // come up so any forwarded request lands on a listening peer.
+      startStubContainer(stub1, 'cam-1-stub');
+      startStubContainer(stub2, 'cam-2-stub');
+
+      const env11 = writeEnvFile('cam-1', stub1, { HFOV_DEG: '79.1' });
+      const env12 = writeEnvFile('cam-2', stub2, { HFOV_DEG: '81.9' });
       composeEnvFiles = [env11, env12];
 
       composeEnv = {
@@ -197,12 +252,6 @@ describe(
         CAM2_HOST_PORT: String(hostPort12),
       };
 
-      const net = run('docker', ['network', 'create', network], { timeoutMs: 30000 });
-      assert.equal(net.status, 0, `docker network create failed: ${net.stderr}`);
-
-      const build = run('docker', ['build', '-t', IMAGE_TAG, '.'], { timeoutMs: 600000 });
-      assert.equal(build.status, 0, `docker build failed:\n${build.stdout}\n${build.stderr}`);
-
       // `down` from here on, even if `up` is killed by its own timeout
       // mid-start — otherwise half-created services with
       // `restart: unless-stopped` survive the run and block the network rm.
@@ -212,7 +261,7 @@ describe(
 
       // Wait until both published ports answer with the respective stub's
       // capabilities (container start + listener bind). A persistent non-200
-      // (e.g. the proxy's 502 when host.docker.internal does not resolve)
+      // (e.g. the proxy's 502 when the upstream container is unreachable)
       // surfaces in the thrown message rather than "never became ready".
       for (const port of [hostPort11, hostPort12]) {
         const deadline = Date.now() + 60000;
@@ -237,10 +286,11 @@ describe(
       try {
         if (composeStarted) compose(['down', '-v', '--remove-orphans'], 120000);
       } finally {
+        // --rm reaps them on kill, but rm -f closes the race with network rm.
+        run('docker', ['rm', '-f', stub1, stub2], { timeoutMs: 30000 });
         run('docker', ['network', 'rm', network], { timeoutMs: 30000 });
         if (tmpDir) fs.rmSync(tmpDir, { recursive: true, force: true });
       }
-      return Promise.all([stubCAM1 && stubCAM1.stop(), stubCAM2 && stubCAM2.stop()]);
     });
 
     it('two instances of the same image run side-by-side on unique host ports', () => {
@@ -302,50 +352,63 @@ describe(
       // GetCapabilities — inner body verbatim, plus the client's
       // WS-UsernameToken relayed verbatim (ADR-0008). (The readiness poll
       // and this test each send one, hence "every" rather than an exact count.)
-      const seen = stubCAM1.requests();
-      assert.ok(seen.length >= 1);
-      for (const req of seen) {
-        assert.ok(
-          req.body.includes('<tds:GetCapabilities><tds:Category>All</tds:Category></tds:GetCapabilities>'),
-          'cam-1 stub must not see traffic meant for cam-2'
-        );
-        assert.ok(
-          req.body.includes(SMOKE_SECURITY),
-          'forwarded envelope must carry the client Security header verbatim'
-        );
+      /** @type {Array<[string, string]>} */
+      const stubsByContainer = [
+        [stub1, 'cam-1-stub'],
+        [stub2, 'cam-2-stub'],
+      ];
+      for (const [container, marker] of stubsByContainer) {
+        const seen = stubRequests(container);
+        assert.ok(seen.length >= 1, `${marker} stub must have received at least one request`);
+        for (const req of seen) {
+          assert.ok(
+            req.body.includes('<tds:GetCapabilities><tds:Category>All</tds:Category></tds:GetCapabilities>'),
+            `${marker} stub must not see traffic meant for the other camera`
+          );
+          assert.ok(
+            req.body.includes(SMOKE_SECURITY),
+            'forwarded envelope must carry the client Security header verbatim'
+          );
+        }
       }
     });
 
     it('a client on the shared network reaches either proxy by container name, not through the host port', () => {
-      for (const [service, marker] of [
+      /** @type {Array<[string, string]>} */
+      const byService = [
         ['proxy-cam-1', 'http://cam-1-stub/'],
         ['proxy-cam-2', 'http://cam-2-stub/'],
-      ]) {
+      ];
+      for (const [service, marker] of byService) {
         // Run the proxy image itself as a one-shot SOAP client against
         // http://<service>:8080/ — container-name addressing on the network.
         // The marker lands in the stub's non-XAddr identity element, which
         // the XAddr rewrite never touches.
-        const client =
-          [
-            "const http=require('http');",
-            `const body=${JSON.stringify(GET_CAPABILITIES)};`,
-            `const marker=${JSON.stringify(marker)};`,
-            `const options={host:${JSON.stringify(service)},port:8080,path:'/onvif/service',method:'POST',` +
-              "headers:{'content-type':'application/soap+xml; charset=utf-8','content-length':Buffer.byteLength(body)}};",
-            'const req=http.request(options,(res)=>{',
-            "let t='';res.setEncoding('utf8');",
-            "res.on('data',(c)=>{t+=c});",
-            "res.on('end',()=>{process.stdout.write(t.includes(marker)?'NAME_OK\\n':'NAME_BAD '+res.statusCode+'\\n');process.exit(0)});",
-            '});',
-            "req.on('error',(e)=>{console.error('CLIENTERR '+e.message);process.exit(2)});",
-            'req.end(body);',
-          ].join('');
+        const client = [
+          "const http=require('http');",
+          `const body=${JSON.stringify(GET_CAPABILITIES)};`,
+          `const marker=${JSON.stringify(marker)};`,
+          `const options={host:${JSON.stringify(service)},port:8080,path:'/onvif/service',method:'POST',` +
+            "headers:{'content-type':'application/soap+xml; charset=utf-8','content-length':Buffer.byteLength(body)}};",
+          'const req=http.request(options,(res)=>{',
+          "let t='';res.setEncoding('utf8');",
+          "res.on('data',(c)=>{t+=c});",
+          "res.on('end',()=>{process.stdout.write(t.includes(marker)?'NAME_OK\\n':'NAME_BAD '+res.statusCode+'\\n');process.exit(0)});",
+          '});',
+          "req.on('error',(e)=>{console.error('CLIENTERR '+e.message);process.exit(2)});",
+          'req.end(body);',
+        ].join('');
         const res = run('docker', ['run', '--rm', '--network', network, '--entrypoint', 'node', IMAGE_TAG, '-e', client], {
           env: composeEnv,
           timeoutMs: 60000,
         });
         assert.equal(res.status, 0, `${service}: client container failed: ${res.stderr}`);
-        assert.ok(res.stdout.includes('NAME_OK'), `${service}: expected container-name OK, got: ${res.stdout}${res.stderr}`);
+        if (!res.stdout.includes('NAME_OK')) {
+          const logs = compose(['logs', '--no-color', '--tail', '100', service]);
+          assert.fail(
+            `${service}: expected container-name OK, got: ${res.stdout}${res.stderr}\n--- proxy logs ---\n${logs.stdout}${logs.stderr}`
+          );
+        }
       }
     });
 
