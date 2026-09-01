@@ -1,0 +1,37 @@
+# The image needs only package.json and src/ (see Dockerfile). Everything
+# else stays out of the build context.
+
+# Dependencies and the lockfile — the proxy is pure Node stdlib; nothing
+# installs in the image.
+node_modules/
+package-lock.json
+
+# Secrets and per-instance config (ADR-0006): env files are mounted via
+# Compose env_file:, never baked into the image.
+.env
+.env.*
+!.env.example
+env/*.env
+
+# VCS / tooling / workspace artefacts
+.git
+.gitignore
+.scratch
+docs
+
+# Tests, probes, and logs — not runtime
+test
+test_logs
+probe
+*.log
+
+# Docs / planning markdown at the repo root
+CLAUDE.md
+CONTEXT.md
+PROBLEMSPACE.md
+handoff.md
+README.md
+Dockerfile
+docker-compose.yml
+.dockerignore
+tsconfig.json

@@ -1,0 +1,16 @@
+node_modules/
+.env
+.env.*
+!.env.example
+env/*.env
+!env/*.env.example
+*.log
+test_logs/
+coverage/
+
+# Local-only scratch: throwaway camera probes (contain real credentials),
+# planning/problem-space artifacts, and the session handoff. Never push.
+probe/
+.scratch/
+handoff.md
+PROBLEMSPACE.md

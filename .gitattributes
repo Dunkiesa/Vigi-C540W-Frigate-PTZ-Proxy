@@ -1,0 +1,8 @@
+# Deployment artefacts are read by tooling on Linux hosts (compose, docker);
+# keep them LF regardless of core.autocrlf.
+.env.example text eol=lf
+env/*.env text eol=lf
+env/*.env.example text eol=lf
+docker-compose.yml text eol=lf
+Dockerfile text eol=lf
+.dockerignore text eol=lf

@@ -1,0 +1,116 @@
+# ONVIF PTZ proxy — Compose deployment (ADR-0007).
+#
+# One service per supported camera (ADR-0004), one `.env` per service
+# (ADR-0006), all on the same Docker network as Frigate. Cameras are physical
+# LAN devices, reached through the Docker host's LAN interface — they are not
+# containers.
+#
+# Bring-up:
+#   1. cp env/cam-1.env.example env/cam-1.env   (and cam-2); adjust IPs if
+#      needed and set per-unit FOV overrides if measured. No credentials go
+#      in these files — Frigate supplies the camera username/password with
+#      every request and the proxy relays it (ADR-0008).
+#   2. Make Frigate's network available to this project — either it already
+#      exists (PROXY_NETWORK defaults to "frigate") or create it once:
+#      docker network create frigate
+#   3. Build the image (the compose file never builds; it only references
+#      the tag below):
+#      npm run docker:build   # = docker build -t onvif-ptz-proxy:latest .
+#   4. docker compose up -d
+#
+# Addressing:
+#   - Frigate on the shared network:  http://proxy-cam-1:8080/onvif/service
+#   - From the Docker host (ad-hoc):  http://127.0.0.1:8001/onvif/service
+#   - Health (per service, in-container): GET /health -> 200 "ok"
+#
+# Adding a third camera later = one service block + one env file (ADR-0007);
+# no code change. The ${...:-default} variables exist so the deployment
+# smoke test can run the same file against stub upstreams and spare host
+# ports; normal use leaves them unset.
+#
+# In-container listen port is 8080 (EXPOSE in the Dockerfile). Keep
+# LISTEN_PORT=8080 in each env file so the published mapping below matches
+# what the process actually binds.
+
+# Top-level extension: shared healthcheck for every proxy service (YAML
+# anchor). GET /health is answered by the proxy process itself and never
+# forwarded upstream, so it proves the listener is up without asserting
+# camera reachability. The port is read from the container environment at
+# runtime — the $$ keeps ${LISTEN_PORT:-8080} out of Compose's own variable
+# expansion — so the check follows a deviating LISTEN_PORT instead of
+# silently failing `service_healthy`. busybox wget exits non-zero on any
+# non-2xx status.
+x-proxy-healthcheck: &proxy-healthcheck
+  test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:$${LISTEN_PORT:-8080}/health"]
+  interval: 5s
+  timeout: 3s
+  retries: 3
+  start_period: 5s
+
+services:
+  proxy-cam-1:
+    image: onvif-ptz-proxy:latest
+    container_name: proxy-cam-1
+    env_file:
+      - ${CAM1_ENV_FILE:-env/cam-1.env}
+    ports:
+      - "${CAM1_HOST_PORT:-8001}:8080"
+    networks:
+      - proxy
+    restart: unless-stopped
+    healthcheck: *proxy-healthcheck
+    extra_hosts:
+      # host.docker.internal:host-gateway — lets an instance point its
+      # upstream at a host-run stub (deployment smoke test); inert for real
+      # LAN cameras.
+      - "host.docker.internal:host-gateway"
+
+  proxy-cam-2:
+    image: onvif-ptz-proxy:latest
+    container_name: proxy-cam-2
+    env_file:
+      - ${CAM2_ENV_FILE:-env/cam-2.env}
+    ports:
+      - "${CAM2_HOST_PORT:-8002}:8080"
+    networks:
+      - proxy
+    restart: unless-stopped
+    healthcheck: *proxy-healthcheck
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  # Running Frigate from this same Compose project: `depends_on` with
+  # `condition: service_healthy` holds Frigate back until each proxy's
+  # /health check passes, so its autotracker never races the proxies during
+  # boot. Un-comment (and fill in Frigate's own volumes/devices) to adopt
+  # this layout; if Frigate stays in its own project, `docker compose up`
+  # ordering across projects cannot use depends_on — bring this file up
+  # first (or rely on Frigate's own ONVIF retries) instead.
+  #
+  # frigate:
+  #   image: ghcr.io/blakeblackshear/frigate:stable
+  #   depends_on:
+  #     proxy-cam-1:
+  #       condition: service_healthy
+  #     proxy-cam-2:
+  #       condition: service_healthy
+  #   networks:
+  #     - proxy
+  #   # Frigate's camera PTZ config then points at the proxies by container
+  #   # name — and carries the camera credentials: the proxy holds none and
+  #   # relays Frigate's WS-UsernameToken to the camera per request (ADR-0008):
+  #   #   cameras:
+  #   #     cam-1:
+  #   #       onvif:
+  #   #         host: proxy-cam-1
+  #   #         port: 8080
+  #   #         username: <camera username>
+  #   #         password: <camera password>
+
+networks:
+  proxy:
+    # The shared network with Frigate (ADR-0007). External so Frigate's own
+    # compose project owns its creation; override PROXY_NETWORK if that
+    # network is named differently in your deployment.
+    name: ${PROXY_NETWORK:-frigate}
+    external: true
